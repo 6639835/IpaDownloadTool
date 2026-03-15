@@ -6,86 +6,99 @@ struct DownloadsView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                AppBackdrop()
+            List {
+                Picker("downloads.mode.label", selection: $mode) {
+                    Text("downloads.mode.inProgress").tag(0)
+                    Text("downloads.mode.completed").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 4, trailing: 0))
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        SectionHeading(
-                            eyebrow: "downloads.heading.eyebrow",
-                            title: "downloads.heading.title",
-                            detail: "downloads.heading.detail"
-                        )
-
-                        Picker("downloads.mode.label", selection: $mode) {
-                            Text("downloads.mode.inProgress").tag(0)
-                            Text("downloads.mode.completed").tag(1)
+                if mode == 0 {
+                    ForEach(model.downloads) { item in
+                        DownloadRow(item: item) {
+                            model.cancelDownload(item.recordID)
                         }
-                        .pickerStyle(.segmented)
-
-                        if mode == 0 {
-                            if model.downloads.isEmpty {
-                                EmptyStateView(
-                                    icon: "arrow.down.circle.dotted",
-                                    title: "downloads.empty.inProgress.title",
-                                    detail: "downloads.empty.inProgress.detail"
-                                )
-                            } else {
-                                LazyVStack(spacing: 14) {
-                                    ForEach(model.downloads) { item in
-                                        DownloadCard(item: item, cancelAction: {
-                                            model.cancelDownload(item.recordID)
-                                        })
-                                    }
+                    }
+                } else {
+                    ForEach(model.downloadedHistory) { record in
+                        Button {
+                            model.presentedRecordID = record.id
+                        } label: {
+                            DownloadedRow(record: record, model: model)
+                        }
+                        .swipeActions(edge: .trailing) {
+                            if let fileURL = model.localFileURL(for: record) {
+                                ShareLink(item: fileURL) {
+                                    Label("history.detail.shareLocalIPA", systemImage: "square.and.arrow.up")
                                 }
-                            }
-                        } else {
-                            if model.downloadedHistory.isEmpty {
-                                EmptyStateView(
-                                    icon: "internaldrive",
-                                    title: "downloads.empty.completed.title",
-                                    detail: "downloads.empty.completed.detail"
-                                )
-                            } else {
-                                LazyVStack(spacing: 14) {
-                                    ForEach(model.downloadedHistory) { record in
-                                        DownloadedCard(record: record, model: model)
-                                    }
-                                }
+                                .tint(.blue)
                             }
                         }
                     }
-                    .padding(20)
                 }
             }
+            .listStyle(.insetGrouped)
             .navigationTitle("downloads.navigation.title")
+            .overlay {
+                if mode == 0 && model.downloads.isEmpty {
+                    ContentUnavailableView(
+                        label: {
+                            Label("downloads.empty.inProgress.title", systemImage: "arrow.down.circle.dotted")
+                        },
+                        description: {
+                            Text("downloads.empty.inProgress.detail")
+                        }
+                    )
+                } else if mode == 1 && model.downloadedHistory.isEmpty {
+                    ContentUnavailableView(
+                        label: {
+                            Label("downloads.empty.completed.title", systemImage: "internaldrive")
+                        },
+                        description: {
+                            Text("downloads.empty.completed.detail")
+                        }
+                    )
+                }
+            }
         }
     }
 }
 
-private struct DownloadCard: View {
+// MARK: - In-Progress Download Row
+
+private struct DownloadRow: View {
     let item: DownloadItem
     let cancelAction: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text(item.title)
-                    .font(.headline)
+                    .font(.body)
                     .lineLimit(2)
-                Spacer(minLength: 12)
+
+                Spacer(minLength: 8)
+
                 Text(item.state.titleKey)
-                    .font(.caption.weight(.semibold))
+                    .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
             }
 
             ProgressView(value: item.expectedBytes > 0 ? item.progress : nil)
                 .progressViewStyle(.linear)
+                .animation(.easeInOut, value: item.progress)
 
             HStack {
                 Text(ByteCountFormatter.string(fromByteCount: item.receivedBytes, countStyle: .file))
                 Spacer()
-                Text(item.expectedBytes > 0 ? ByteCountFormatter.string(fromByteCount: item.expectedBytes, countStyle: .file) : L10n.string("downloads.size.calculating"))
+                if item.expectedBytes > 0 {
+                    Text(ByteCountFormatter.string(fromByteCount: item.expectedBytes, countStyle: .file))
+                } else {
+                    Text("downloads.size.calculating")
+                }
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -95,47 +108,40 @@ private struct DownloadCard: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
-
+        }
+        .padding(.vertical, 4)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             if item.state == .downloading || item.state == .queued {
-                Button("downloads.action.cancel", role: .cancel, action: cancelAction)
-                    .buttonStyle(.glass)
+                Button(action: cancelAction) {
+                    Label("downloads.action.cancel", systemImage: "xmark")
+                }
+                .tint(.red)
             }
         }
-        .glassPanel()
     }
 }
 
-private struct DownloadedCard: View {
+// MARK: - Completed Download Row
+
+private struct DownloadedRow: View {
     let record: IpaRecord
     let model: AppModel
 
     var body: some View {
-        HStack(spacing: 16) {
-            IpaArtworkView(title: record.displayTitle, iconURL: record.iconURL)
+        HStack(spacing: 14) {
+            IpaArtworkView(title: record.displayTitle, iconURL: record.iconURL, size: 48)
 
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(record.displayFileName)
-                    .font(.headline)
+                    .font(.body)
+                    .foregroundStyle(.primary)
                     .lineLimit(2)
+
                 Text(model.fileSizeText(for: record))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-
-            Spacer(minLength: 12)
-
-            if let fileURL = model.localFileURL(for: record) {
-                ShareLink(item: fileURL) {
-                    Image(systemName: "square.and.arrow.up")
-                        .font(.title3.weight(.semibold))
-                        .frame(width: 40, height: 40)
-                }
-                .buttonStyle(.glass)
-            }
         }
-        .glassPanel()
-        .onTapGesture {
-            model.presentedRecordID = record.id
-        }
+        .padding(.vertical, 4)
     }
 }

@@ -6,66 +6,70 @@ struct HistoryView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                AppBackdrop()
-
+            Group {
                 if model.sortedHistory.isEmpty {
-                    ScrollView {
-                        EmptyStateView(
-                            icon: "tray",
-                            title: "history.empty.title",
-                            detail: "history.empty.detail"
-                        )
-                        .padding(20)
-                    }
+                    ContentUnavailableView(
+                        label: {
+                            Label("history.empty.title", systemImage: "tray")
+                        },
+                        description: {
+                            Text("history.empty.detail")
+                        }
+                    )
                 } else {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 18) {
-                            SectionHeading(
-                                eyebrow: "history.heading.eyebrow",
-                                title: "history.heading.title",
-                                detail: "history.heading.detail"
-                            )
-
-                            Picker("history.sort.label", selection: $model.settings.historySort) {
-                                ForEach(HistorySort.allCases) { sort in
-                                    Text(sort.titleKey).tag(sort)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            .onChange(of: model.settings.historySort) { _, _ in
-                                model.persist()
-                            }
-
-                            LazyVStack(spacing: 14) {
-                                ForEach(model.sortedHistory) { record in
-                                    Button {
-                                        model.presentedRecordID = record.id
-                                    } label: {
-                                        HistoryCard(record: record, model: model)
-                                    }
-                                    .buttonStyle(.plain)
-                                    .contextMenu {
-                                        Button {
-                                            model.presentedRecordID = record.id
-                                        } label: {
-                                            Label("history.action.viewDetails", systemImage: "info.circle")
-                                        }
-                                        Button {
-                                            model.startDownload(for: record.id)
-                                        } label: {
-                                            Label("history.action.startDownload", systemImage: "arrow.down.circle")
-                                        }
-                                        Button(role: .destructive) {
-                                            model.deleteHistoryRecord(record.id)
-                                        } label: {
-                                            Label("history.action.delete", systemImage: "trash")
-                                        }
-                                    }
-                                }
+                    List {
+                        Picker("history.sort.label", selection: $model.settings.historySort) {
+                            ForEach(HistorySort.allCases) { sort in
+                                Text(sort.titleKey).tag(sort)
                             }
                         }
-                        .padding(20)
+                        .pickerStyle(.segmented)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 4, trailing: 0))
+
+                        ForEach(model.sortedHistory) { record in
+                            Button {
+                                model.presentedRecordID = record.id
+                            } label: {
+                                HistoryRow(record: record)
+                            }
+                            .contextMenu {
+                                Button {
+                                    model.presentedRecordID = record.id
+                                } label: {
+                                    Label("history.action.viewDetails", systemImage: "info.circle")
+                                }
+                                Button {
+                                    model.startDownload(for: record.id)
+                                } label: {
+                                    Label("history.action.startDownload", systemImage: "arrow.down.circle")
+                                }
+                                Divider()
+                                Button(role: .destructive) {
+                                    model.deleteHistoryRecord(record.id)
+                                } label: {
+                                    Label("history.action.delete", systemImage: "trash")
+                                }
+                            }
+                            .swipeActions(edge: .trailing) {
+                                Button(role: .destructive) {
+                                    model.deleteHistoryRecord(record.id)
+                                } label: {
+                                    Label("history.action.delete", systemImage: "trash")
+                                }
+                                Button {
+                                    model.startDownload(for: record.id)
+                                } label: {
+                                    Label("history.action.startDownload", systemImage: "arrow.down.circle")
+                                }
+                                .tint(.blue)
+                            }
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                    .onChange(of: model.settings.historySort) { _, _ in
+                        model.persist()
                     }
                 }
             }
@@ -95,44 +99,43 @@ struct HistoryView: View {
     }
 }
 
-private struct HistoryCard: View {
+// MARK: - History Row
+
+private struct HistoryRow: View {
     let record: IpaRecord
-    let model: AppModel
 
     var body: some View {
-        HStack(spacing: 16) {
-            IpaArtworkView(title: record.displayTitle, iconURL: record.iconURL)
+        HStack(spacing: 14) {
+            IpaArtworkView(title: record.displayTitle, iconURL: record.iconURL, size: 52)
 
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(record.displayTitle)
-                    .font(.headline)
+                    .font(.body)
                     .foregroundStyle(.primary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(1)
 
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     if let version = record.version, !version.isEmpty {
-                        Label(version, systemImage: "number")
+                        Text("v\(version)")
+                            .foregroundStyle(.secondary)
                     }
                     if record.hasLocalFile {
                         Label("history.badge.downloaded", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
                     }
                 }
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
+                .font(.caption)
 
                 Text(record.createdAt.localizedTimestamp)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .foregroundStyle(.tertiary)
             }
-
-            Image(systemName: "chevron.right")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.tertiary)
         }
-        .glassPanel()
+        .padding(.vertical, 4)
     }
 }
+
+// MARK: - IPA Detail View
 
 struct IpaDetailView: View {
     @ObservedObject var model: AppModel
@@ -146,85 +149,76 @@ struct IpaDetailView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                AppBackdrop()
-
+            Group {
                 if let record {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 18) {
+                    Form {
+                        // Header
+                        Section {
                             HStack(spacing: 16) {
-                                IpaArtworkView(title: record.displayTitle, iconURL: record.iconURL)
+                                IpaArtworkView(title: record.displayTitle, iconURL: record.iconURL, size: 64)
 
-                                VStack(alignment: .leading, spacing: 8) {
+                                VStack(alignment: .leading, spacing: 4) {
                                     Text(record.displayTitle)
-                                        .font(.title2.weight(.bold))
-                                    Text(record.version ?? L10n.string("history.detail.versionMissing"))
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
+                                        .font(.title3.weight(.semibold))
+                                    if let version = record.version, !version.isEmpty {
+                                        Text("v\(version)")
+                                            .font(.subheadline)
+                                            .foregroundStyle(.secondary)
+                                    }
                                     if record.hasLocalFile {
                                         Label(model.fileSizeText(for: record), systemImage: "internaldrive")
-                                            .font(.caption.weight(.medium))
+                                            .font(.caption)
                                             .foregroundStyle(.secondary)
                                     }
                                 }
+
                                 Spacer(minLength: 0)
                             }
-                            .glassPanel(cornerRadius: 34)
+                            .padding(.vertical, 6)
+                        }
 
-                            VStack(alignment: .leading, spacing: 14) {
-                                Text("history.detail.appName")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                                TextField("history.detail.appNamePlaceholder", text: $draftTitle)
-                                    .textInputAutocapitalization(.never)
-                                    .onSubmit {
-                                        model.renameRecord(id: record.id, title: draftTitle)
-                                    }
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 12)
-                                    .background(.white.opacity(0.18), in: .rect(cornerRadius: 18))
+                        // Name editor
+                        Section("history.detail.appName") {
+                            TextField("history.detail.appNamePlaceholder", text: $draftTitle)
+                                .autocorrectionDisabled()
+                                .onSubmit {
+                                    model.renameRecord(id: recordID, title: draftTitle)
+                                }
+                        }
+
+                        // Metadata
+                        Section("history.detail.info") {
+                            DetailInfoRow("history.detail.bundleIdentifier", value: record.bundleIdentifier ?? "—")
+                            DetailInfoRow("history.detail.downloadURL", value: record.downloadURL)
+                            DetailInfoRow("history.detail.sourceURL", value: record.fromPageURL ?? "—")
+                            DetailInfoRow("history.detail.createdAt", value: record.createdAt.localizedTimestamp)
+                        }
+
+                        // Actions
+                        Section {
+                            Button("history.detail.downloadAgain") {
+                                model.startDownload(for: record.id)
                             }
-                            .glassPanel()
 
-                            VStack(alignment: .leading, spacing: 16) {
-                                DetailLine(title: "history.detail.bundleIdentifier", value: record.bundleIdentifier ?? L10n.string("common.unknown"))
-                                DetailLine(title: "history.detail.downloadURL", value: record.downloadURL)
-                                DetailLine(title: "history.detail.sourceURL", value: record.fromPageURL ?? L10n.string("common.unknown"))
-                                DetailLine(title: "history.detail.createdAt", value: record.createdAt.localizedTimestamp)
-                            }
-                            .glassPanel()
-
-                            GlassEffectContainer(spacing: 12) {
-                                VStack(spacing: 12) {
-                                    Button("history.detail.downloadAgain") {
-                                        model.startDownload(for: record.id)
-                                    }
-                                    .buttonStyle(.glassProminent)
-
-                                    if let fileURL = model.localFileURL(for: record), fileURL.isFileURL {
-                                        ShareLink(item: fileURL) {
-                                            Label("history.detail.shareLocalIPA", systemImage: "square.and.arrow.up")
-                                                .frame(maxWidth: .infinity)
-                                        }
-                                        .buttonStyle(.glass)
-                                    }
+                            if let fileURL = model.localFileURL(for: record), fileURL.isFileURL {
+                                ShareLink(item: fileURL) {
+                                    Label("history.detail.shareLocalIPA", systemImage: "square.and.arrow.up")
                                 }
                             }
                         }
-                        .padding(20)
                     }
                     .onAppear {
                         draftTitle = record.displayTitle
                     }
                 } else {
-                    ScrollView {
-                        EmptyStateView(
-                            icon: "exclamationmark.triangle",
-                            title: "history.detail.missing.title",
-                            detail: "history.detail.missing.detail"
-                        )
-                        .padding(20)
-                    }
+                    ContentUnavailableView(
+                        label: {
+                            Label("history.detail.missing.title", systemImage: "exclamationmark.triangle")
+                        },
+                        description: {
+                            Text("history.detail.missing.detail")
+                        }
+                    )
                 }
             }
             .navigationTitle("history.detail.navigation.title")
@@ -234,8 +228,33 @@ struct IpaDetailView: View {
                     Button("common.done") {
                         model.presentedRecordID = nil
                     }
+                    .fontWeight(.semibold)
                 }
             }
         }
+    }
+}
+
+// MARK: - Detail Info Row
+
+private struct DetailInfoRow: View {
+    let title: LocalizedStringKey
+    let value: String
+
+    init(_ title: LocalizedStringKey, value: String) {
+        self.title = title
+        self.value = value
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.body)
+                .textSelection(.enabled)
+        }
+        .padding(.vertical, 2)
     }
 }

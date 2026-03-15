@@ -88,7 +88,7 @@ struct PersistenceController {
         if let legacy = try? decoder.decode(LegacyExportBundle.self, from: data) {
             return ImportBundle(
                 ipaHistory: legacy.ipaHistory.map(\.record),
-                webHistory: legacy.webHistory
+                webHistory: legacy.webHistory.compactMap(\.entry)
             )
         }
 
@@ -158,12 +158,12 @@ private struct ExportedIpaRecord: Codable {
     }
 }
 
-private struct LegacyExportBundle: Codable {
+private struct LegacyExportBundle: Decodable {
     var ipaHistory: [LegacyIpaRecord]
-    var webHistory: [WebHistoryEntry]
+    var webHistory: [LegacyWebHistoryEntry]
 }
 
-private struct LegacyIpaRecord: Codable {
+private struct LegacyIpaRecord: Decodable {
     var sign: String?
     var title: String?
     var version: String?
@@ -187,4 +187,79 @@ private struct LegacyIpaRecord: Codable {
             localFileName: nil
         )
     }
+}
+
+private struct LegacyWebHistoryEntry: Decodable {
+    var title: String?
+    var url: String
+    var host: String
+    var faviconURL: String?
+    var lastVisitedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case url
+        case urlStr
+        case host
+        case hostStr
+        case favicon
+        case faviconURL
+        case time
+        case lastVisitedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        url = try container.decodeIfPresent(String.self, forKey: .urlStr)
+            ?? container.decodeIfPresent(String.self, forKey: .url)
+            ?? ""
+
+        let derivedHost = URL(string: url)?.host ?? url
+        host = try container.decodeIfPresent(String.self, forKey: .hostStr)
+            ?? container.decodeIfPresent(String.self, forKey: .host)
+            ?? derivedHost
+
+        faviconURL = try container.decodeIfPresent(String.self, forKey: .favicon)
+            ?? container.decodeIfPresent(String.self, forKey: .faviconURL)
+
+        if let decodedDate = try? container.decodeIfPresent(Date.self, forKey: .lastVisitedAt) {
+            lastVisitedAt = decodedDate
+        } else {
+            let rawDate = try container.decodeIfPresent(String.self, forKey: .lastVisitedAt)
+                ?? container.decodeIfPresent(String.self, forKey: .time)
+            lastVisitedAt = Self.parseDate(rawDate) ?? .now
+        }
+    }
+
+    var entry: WebHistoryEntry? {
+        let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty else { return nil }
+
+        let trimmedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let resolvedHost = host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? (URL(string: trimmedURL)?.host ?? trimmedURL) : host
+
+        return WebHistoryEntry(
+            id: UUID(),
+            title: trimmedTitle.isEmpty ? resolvedHost : trimmedTitle,
+            url: trimmedURL,
+            host: resolvedHost,
+            faviconURL: faviconURL,
+            lastVisitedAt: lastVisitedAt
+        )
+    }
+
+    private static func parseDate(_ value: String?) -> Date? {
+        guard let value, !value.isEmpty else { return nil }
+        return DateFormatter.legacyImportTimestamp.date(from: value)
+            ?? Self.iso8601Formatter.date(from: value)
+            ?? Self.iso8601FractionalFormatter.date(from: value)
+    }
+
+    private static let iso8601Formatter = ISO8601DateFormatter()
+    private static let iso8601FractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 }

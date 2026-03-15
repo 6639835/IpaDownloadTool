@@ -5,29 +5,21 @@ struct RootView: View {
 
     var body: some View {
         TabView(selection: $model.selectedTab) {
-            BrowserView(model: model)
-                .tag(RootTab.browser)
-                .tabItem {
-                    Label("tab.browser", systemImage: "safari")
-                }
+            Tab("tab.browser", systemImage: "globe", value: RootTab.browser) {
+                BrowserView(model: model)
+            }
 
-            HistoryView(model: model)
-                .tag(RootTab.history)
-                .tabItem {
-                    Label("tab.history", systemImage: "clock.fill")
-                }
+            Tab("tab.history", systemImage: "clock.fill", value: RootTab.history) {
+                HistoryView(model: model)
+            }
 
-            DownloadsView(model: model)
-                .tag(RootTab.downloads)
-                .tabItem {
-                    Label("tab.downloads", systemImage: "arrow.down.circle.fill")
-                }
+            Tab("tab.downloads", systemImage: "arrow.down.circle.fill", value: RootTab.downloads) {
+                DownloadsView(model: model)
+            }
 
-            SettingsView(model: model)
-                .tag(RootTab.settings)
-                .tabItem {
-                    Label("tab.settings", systemImage: "gearshape.fill")
-                }
+            Tab("tab.settings", systemImage: "gearshape.fill", value: RootTab.settings) {
+                SettingsView(model: model)
+            }
         }
         .sheet(
             isPresented: Binding(

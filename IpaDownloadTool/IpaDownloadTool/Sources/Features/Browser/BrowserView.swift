@@ -9,102 +9,63 @@ struct BrowserView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                AppBackdrop()
+            NativeWebView(browser: browser)
+                .overlay(alignment: .top) {
+                    if browser.isLoading {
+                        ProgressView(value: browser.progress)
+                            .progressViewStyle(.linear)
+                            .animation(.easeInOut, value: browser.progress)
+                    }
+                }
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .principal) {
+                        AddressBar(browser: browser)
+                    }
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        SectionHeading(
-                            eyebrow: "browser.heading.eyebrow",
-                            title: "browser.heading.title",
-                            detail: "browser.heading.detail"
-                        )
-
-                        VStack(alignment: .leading, spacing: 14) {
-                            HStack(alignment: .top, spacing: 14) {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    TextField("browser.address.placeholder", text: $browser.addressText)
-                                        .textInputAutocapitalization(.never)
-                                        .autocorrectionDisabled()
-                                        .keyboardType(.URL)
-                                        .font(.body.monospaced())
-                                        .onSubmit {
-                                            browser.load(browser.addressText)
-                                        }
-
-                                    Text(browser.currentTitle.isEmpty ? L10n.string("browser.address.idleTitle") : browser.currentTitle)
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
-                                }
-
-                                GlassEffectContainer(spacing: 10) {
-                                    VStack(spacing: 10) {
-                                        Button {
-                                            browser.load(browser.addressText)
-                                        } label: {
-                                            Image(systemName: "arrow.turn.down.right")
-                                                .frame(width: 42, height: 42)
-                                        }
-                                        .buttonStyle(.glassProminent)
-
-                                        PasteButton(payloadType: String.self) { strings in
-                                            guard let first = strings.first else { return }
-                                            browser.addressText = first
-                                            browser.load(first)
-                                        }
-                                        .labelStyle(.iconOnly)
-
-                                        Button {
-                                            browser.scannerPresented = true
-                                        } label: {
-                                            Image(systemName: "qrcode.viewfinder")
-                                                .frame(width: 42, height: 42)
-                                        }
-                                        .buttonStyle(.glass)
-                                    }
-                                }
-                            }
+                    ToolbarItemGroup(placement: .topBarTrailing) {
+                        PasteButton(payloadType: String.self) { strings in
+                            guard let first = strings.first else { return }
+                            browser.addressText = first
+                            browser.load(first)
                         }
-                        .glassPanel(cornerRadius: 34)
+                        .labelStyle(.iconOnly)
 
-                        GlassEffectContainer(spacing: 10) {
-                            HStack(spacing: 10) {
-                                BrowserControlButton(systemImage: "chevron.left", enabled: browser.canGoBack) {
-                                    browser.goBack()
-                                }
-
-                                BrowserControlButton(systemImage: "chevron.right", enabled: browser.canGoForward) {
-                                    browser.goForward()
-                                }
-
-                                BrowserControlButton(systemImage: "arrow.clockwise", enabled: browser.hasLoadedPage) {
-                                    browser.reload()
-                                }
-
-                                BrowserControlButton(systemImage: "safari", enabled: browser.hasLoadedPage) {
-                                    browser.openInSafari()
-                                }
-                            }
-                        }
-
-                        ZStack(alignment: .top) {
-                            NativeWebView(browser: browser)
-                                .frame(minHeight: 560)
-                                .clipShape(.rect(cornerRadius: 36))
-                                .glassPanel(cornerRadius: 36)
-
-                            if browser.isLoading {
-                                ProgressView(value: browser.progress)
-                                    .progressViewStyle(.linear)
-                                    .padding(.horizontal, 24)
-                                    .padding(.top, 14)
-                            }
+                        Button {
+                            browser.scannerPresented = true
+                        } label: {
+                            Image(systemName: "qrcode.viewfinder")
                         }
                     }
-                    .padding(20)
+
+                    ToolbarItemGroup(placement: .bottomBar) {
+                        Button { browser.goBack() } label: {
+                            Image(systemName: "chevron.left")
+                        }
+                        .disabled(!browser.canGoBack)
+
+                        Spacer()
+
+                        Button { browser.goForward() } label: {
+                            Image(systemName: "chevron.right")
+                        }
+                        .disabled(!browser.canGoForward)
+
+                        Spacer()
+
+                        Button { browser.reload() } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .disabled(!browser.hasLoadedPage)
+
+                        Spacer()
+
+                        Button { browser.openInSafari() } label: {
+                            Image(systemName: "safari")
+                        }
+                        .disabled(!browser.hasLoadedPage)
+                    }
                 }
-            }
-            .navigationTitle("browser.navigation.title")
         }
         .task {
             syncCallbacks()
@@ -154,12 +115,10 @@ struct BrowserView: View {
             Text("browser.provision.message")
         }
         .sheet(isPresented: $browser.scannerPresented) {
-            NavigationStack {
-                ScannerSheet { value in
-                    browser.scannerPresented = false
-                    browser.addressText = value
-                    browser.load(value)
-                }
+            ScannerSheet { value in
+                browser.scannerPresented = false
+                browser.addressText = value
+                browser.load(value)
             }
         }
     }
@@ -176,7 +135,8 @@ struct BrowserView: View {
             model.upsertRecord(record)
         }
         browser.onDirectIPARecord = { record in
-            model.upsertRecord(record)
+            model.upsertRecord(record, present: false)
+            model.startDownload(for: record.id)
         }
         browser.onNotice = { title, message in
             model.notice = AppNotice(title: title, message: message)
@@ -184,22 +144,34 @@ struct BrowserView: View {
     }
 }
 
-private struct BrowserControlButton: View {
-    let systemImage: String
-    let enabled: Bool
-    let action: () -> Void
+// MARK: - Address Bar
+
+private struct AddressBar: View {
+    @ObservedObject var browser: BrowserController
 
     var body: some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.title3.weight(.semibold))
-                .frame(maxWidth: .infinity)
-                .frame(height: 44)
+        HStack(spacing: 6) {
+            Image(systemName: browser.hasLoadedPage ? "lock.fill" : "globe")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            TextField("browser.address.placeholder", text: $browser.addressText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+                .font(.subheadline)
+                .onSubmit {
+                    browser.load(browser.addressText)
+                }
         }
-        .buttonStyle(.glass)
-        .disabled(!enabled)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.quaternary, in: .capsule)
+        .frame(maxWidth: .infinity)
     }
 }
+
+// MARK: - WebView Bridge
 
 private struct NativeWebView: UIViewRepresentable {
     @ObservedObject var browser: BrowserController
@@ -210,6 +182,8 @@ private struct NativeWebView: UIViewRepresentable {
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
+
+// MARK: - Browser Controller
 
 @MainActor
 final class BrowserController: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
@@ -275,17 +249,9 @@ final class BrowserController: NSObject, ObservableObject, WKNavigationDelegate,
         webView.load(URLRequest(url: url))
     }
 
-    func goBack() {
-        webView.goBack()
-    }
-
-    func goForward() {
-        webView.goForward()
-    }
-
-    func reload() {
-        webView.reload()
-    }
+    func goBack() { webView.goBack() }
+    func goForward() { webView.goForward() }
+    func reload() { webView.reload() }
 
     func openInSafari() {
         guard let url = webView.url else { return }
@@ -414,34 +380,37 @@ final class BrowserController: NSObject, ObservableObject, WKNavigationDelegate,
     }
 }
 
+// MARK: - QR Scanner Sheet
+
 private struct ScannerSheet: View {
     let onScan: (String) -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+        NavigationStack {
+            ZStack {
+                Color.black.ignoresSafeArea()
 
-            VStack(spacing: 20) {
-                QRScannerView(onScan: { value in
-                    onScan(value)
-                })
-                .clipShape(.rect(cornerRadius: 28))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 28, style: .continuous)
-                        .stroke(.white.opacity(0.6), lineWidth: 1)
+                VStack(spacing: 24) {
+                    QRScannerView(onScan: onScan)
+                        .clipShape(.rect(cornerRadius: 24))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 24)
+                                .stroke(.white.opacity(0.35), lineWidth: 1)
+                        }
+
+                    Text("browser.scanner.instruction")
+                        .foregroundStyle(.white.opacity(0.8))
+                        .font(.subheadline)
                 }
-
-                Text("browser.scanner.instruction")
-                    .foregroundStyle(.white.opacity(0.8))
-                    .font(.body.weight(.medium))
+                .padding(24)
             }
-            .padding(20)
-        }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("common.close") {
-                    dismiss()
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.black, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("common.close") { dismiss() }
                 }
             }
         }
@@ -484,9 +453,7 @@ private struct QRScannerView: UIViewRepresentable {
             case .notDetermined:
                 AVCaptureDevice.requestAccess(for: .video) { granted in
                     if granted {
-                        DispatchQueue.main.async {
-                            self.startSession()
-                        }
+                        DispatchQueue.main.async { self.startSession() }
                     }
                 }
             default:

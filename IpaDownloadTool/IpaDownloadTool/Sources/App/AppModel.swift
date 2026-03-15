@@ -153,19 +153,20 @@ final class AppModel: ObservableObject {
     }
 
     func deleteHistoryRecord(_ id: String) {
-        guard let record = record(for: id), let fileURL = localFileURL(for: record) else {
-            ipaHistory.removeAll { $0.id == id }
-            persist()
-            return
-        }
+        cancelDownload(id)
 
-        persistence.deleteFileIfNeeded(at: fileURL)
+        if let record = record(for: id), let fileURL = localFileURL(for: record) {
+            persistence.deleteFileIfNeeded(at: fileURL)
+        }
         ipaHistory.removeAll { $0.id == id }
         downloads.removeAll { $0.recordID == id }
         persist()
     }
 
     func clearHistory() {
+        downloads
+            .filter { $0.state == .queued || $0.state == .downloading }
+            .forEach { cancelDownload($0.recordID) }
         ipaHistory.compactMap(localFileURL(for:)).forEach(persistence.deleteFileIfNeeded(at:))
         ipaHistory.removeAll()
         downloads.removeAll()
@@ -188,22 +189,23 @@ final class AppModel: ObservableObject {
         }
 
         do {
+            downloadCoordinator.cancel(recordID: record.id, emitEvent: false)
             try persistence.prepareDirectories()
-            let destinationURL = try downloadURL(for: record)
+            let destination = downloadDestination(for: record)
             updateDownload(
                 DownloadItem(
                     id: record.id,
                     recordID: record.id,
                     title: record.displayFileName,
                     sourceURL: record.downloadURL,
-                    destinationURL: destinationURL,
+                    destinationURL: destination.finalURL,
                     receivedBytes: 0,
                     expectedBytes: 0,
                     state: .queued,
                     errorMessage: nil
                 )
             )
-            downloadCoordinator.start(recordID: record.id, sourceURL: sourceURL, destinationURL: destinationURL)
+            downloadCoordinator.start(recordID: record.id, sourceURL: sourceURL, destination: destination)
             selectedTab = .downloads
         } catch {
             notice = AppNotice(title: L10n.string("notice.downloadFailed.title"), message: error.localizedDescription)
@@ -296,6 +298,10 @@ final class AppModel: ObservableObject {
             updateDownloadProgress(recordID: recordID, receivedBytes: receivedBytes, expectedBytes: expectedBytes)
         case let .finished(recordID, fileName):
             if let index = ipaHistory.firstIndex(where: { $0.id == recordID }) {
+                if let previousFileName = ipaHistory[index].localFileName, previousFileName != fileName {
+                    let previousURL = persistence.downloadsDirectory.appendingPathComponent(previousFileName, isDirectory: false)
+                    persistence.deleteFileIfNeeded(at: previousURL)
+                }
                 ipaHistory[index].localFileName = fileName
             }
             markDownloadFinished(recordID: recordID)
@@ -335,16 +341,34 @@ final class AppModel: ObservableObject {
         downloads[index].errorMessage = message
     }
 
-    private func downloadURL(for record: IpaRecord) throws -> URL {
+    private func downloadDestination(for record: IpaRecord) -> DownloadCoordinator.Destination {
         let fileName = "\(record.id)-\(record.displayFileName)"
-        let sanitized = fileName.replacingOccurrences(of: "/", with: "-")
-        let destinationURL = persistence.downloadsDirectory.appendingPathComponent(sanitized)
-        persistence.deleteFileIfNeeded(at: destinationURL)
-        return destinationURL
+        let sanitizedFileName = fileName.replacingOccurrences(of: "/", with: "-")
+        let finalURL = persistence.downloadsDirectory.appendingPathComponent(sanitizedFileName, isDirectory: false)
+
+        let shouldPreserveExistingFile = record.localFileName
+            .map { persistence.downloadsDirectory.appendingPathComponent($0, isDirectory: false) }
+            .map(persistence.fileExists(at:))
+            ?? false
+
+        if shouldPreserveExistingFile {
+            let stagingFileName = "\(record.id)-\(UUID().uuidString).download"
+            let stagingURL = persistence.downloadsDirectory.appendingPathComponent(stagingFileName, isDirectory: false)
+            persistence.deleteFileIfNeeded(at: stagingURL)
+            return DownloadCoordinator.Destination(stagingURL: stagingURL, finalURL: finalURL)
+        }
+
+        persistence.deleteFileIfNeeded(at: finalURL)
+        return DownloadCoordinator.Destination(stagingURL: finalURL, finalURL: finalURL)
     }
 }
 
 private final class DownloadCoordinator: NSObject, URLSessionDownloadDelegate {
+    struct Destination {
+        var stagingURL: URL
+        var finalURL: URL
+    }
+
     enum Event {
         case progress(recordID: String, receivedBytes: Int64, expectedBytes: Int64)
         case finished(recordID: String, fileName: String)
@@ -361,27 +385,35 @@ private final class DownloadCoordinator: NSObject, URLSessionDownloadDelegate {
     }()
 
     private var taskMap: [Int: TaskContext] = [:]
+    private var recordTasks: [String: URLSessionDownloadTask] = [:]
 
     struct TaskContext {
         var recordID: String
-        var destinationURL: URL
+        var stagingURL: URL
+        var finalURL: URL
     }
 
-    func start(recordID: String, sourceURL: URL, destinationURL: URL) {
+    func start(recordID: String, sourceURL: URL, destination: Destination) {
         var request = URLRequest(url: sourceURL)
         request.setValue("com.apple.appstored/1.0 iOS/18.0", forHTTPHeaderField: "User-Agent")
         let task = session.downloadTask(with: request)
-        taskMap[task.taskIdentifier] = TaskContext(recordID: recordID, destinationURL: destinationURL)
+        taskMap[task.taskIdentifier] = TaskContext(
+            recordID: recordID,
+            stagingURL: destination.stagingURL,
+            finalURL: destination.finalURL
+        )
+        recordTasks[recordID] = task
         task.resume()
     }
 
-    func cancel(recordID: String) {
-        guard let pair = taskMap.first(where: { $0.value.recordID == recordID }) else { return }
-        session.getAllTasks { tasks in
-            tasks.first(where: { $0.taskIdentifier == pair.key })?.cancel()
+    func cancel(recordID: String, emitEvent: Bool = true) {
+        guard let task = recordTasks[recordID] else { return }
+        task.cancel()
+        _ = removeTask(task.taskIdentifier)
+
+        if emitEvent {
+            eventHandler?(.cancelled(recordID: recordID))
         }
-        taskMap.removeValue(forKey: pair.key)
-        eventHandler?(.cancelled(recordID: recordID))
     }
 
     func urlSession(
@@ -397,22 +429,40 @@ private final class DownloadCoordinator: NSObject, URLSessionDownloadDelegate {
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let context = taskMap[downloadTask.taskIdentifier] else { return }
+        let fileManager = FileManager.default
 
         do {
-            let destinationURL = context.destinationURL
-            try? FileManager.default.removeItem(at: destinationURL)
-            try FileManager.default.moveItem(at: location, to: destinationURL)
-            eventHandler?(.finished(recordID: context.recordID, fileName: destinationURL.lastPathComponent))
+            try? fileManager.removeItem(at: context.stagingURL)
+            try fileManager.moveItem(at: location, to: context.stagingURL)
+
+            let completedURL: URL
+            if context.stagingURL == context.finalURL {
+                completedURL = context.finalURL
+            } else if fileManager.fileExists(atPath: context.finalURL.path) {
+                completedURL = try fileManager.replaceItemAt(
+                    context.finalURL,
+                    withItemAt: context.stagingURL,
+                    backupItemName: nil
+                ) ?? context.finalURL
+            } else {
+                try fileManager.moveItem(at: context.stagingURL, to: context.finalURL)
+                completedURL = context.finalURL
+            }
+
+            eventHandler?(.finished(recordID: context.recordID, fileName: completedURL.lastPathComponent))
         } catch {
+            if context.stagingURL != context.finalURL {
+                try? fileManager.removeItem(at: context.stagingURL)
+            }
             eventHandler?(.failed(recordID: context.recordID, message: error.localizedDescription))
         }
 
-        taskMap.removeValue(forKey: downloadTask.taskIdentifier)
+        _ = removeTask(downloadTask.taskIdentifier)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let context = taskMap[task.taskIdentifier] else { return }
-        defer { taskMap.removeValue(forKey: task.taskIdentifier) }
+        defer { _ = removeTask(task.taskIdentifier) }
 
         if let error {
             let nsError = error as NSError
@@ -422,5 +472,11 @@ private final class DownloadCoordinator: NSObject, URLSessionDownloadDelegate {
                 eventHandler?(.failed(recordID: context.recordID, message: error.localizedDescription))
             }
         }
+    }
+
+    private func removeTask(_ taskIdentifier: Int) -> TaskContext? {
+        guard let context = taskMap.removeValue(forKey: taskIdentifier) else { return nil }
+        recordTasks.removeValue(forKey: context.recordID)
+        return context
     }
 }
