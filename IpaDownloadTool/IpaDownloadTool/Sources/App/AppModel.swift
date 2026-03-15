@@ -1,0 +1,426 @@
+import Foundation
+import Combine
+import UIKit
+
+@MainActor
+final class AppModel: ObservableObject {
+    @Published var settings: AppSettings
+    @Published var ipaHistory: [IpaRecord]
+    @Published var webHistory: [WebHistoryEntry]
+    @Published var downloads: [DownloadItem] = []
+    @Published var selectedTab: RootTab = .browser
+    @Published var presentedRecordID: String?
+    @Published var notice: AppNotice?
+    @Published var sharePayload: SharePayload?
+    @Published var pasteboardPromptURL: String?
+    @Published var pendingBrowserLoadURL: String?
+    @Published var showAgreementSheet = false
+
+    let extractor = ManifestExtractor()
+
+    private let persistence = PersistenceController()
+    private let downloadCoordinator = DownloadCoordinator()
+    private var hasActivated = false
+
+    init() {
+        let snapshot = persistence.loadSnapshot()
+        settings = snapshot.settings
+        ipaHistory = snapshot.ipaHistory
+        webHistory = snapshot.webHistory
+
+        downloadCoordinator.eventHandler = { [weak self] event in
+            Task { @MainActor in
+                self?.handleDownloadEvent(event)
+            }
+        }
+    }
+
+    var sortedHistory: [IpaRecord] {
+        switch settings.historySort {
+        case .createdAtDescending:
+            ipaHistory.sorted { $0.createdAt > $1.createdAt }
+        case .fileNameAscending:
+            ipaHistory.sorted {
+                $0.displayTitle.localizedStandardCompare($1.displayTitle) == .orderedAscending
+            }
+        }
+    }
+
+    var downloadedHistory: [IpaRecord] {
+        ipaHistory.filter { record in
+            guard let url = localFileURL(for: record) else { return false }
+            return persistence.fileExists(at: url)
+        }
+        .sorted { lhs, rhs in
+            lhs.createdAt > rhs.createdAt
+        }
+    }
+
+    func activate() {
+        if !hasActivated {
+            hasActivated = true
+            showAgreementSheet = !settings.userAgreementAccepted
+        }
+        checkPasteboard()
+        cleanupMissingFiles()
+    }
+
+    func persist() {
+        persistence.saveSnapshot(snapshot)
+    }
+
+    var snapshot: AppSnapshot {
+        AppSnapshot(settings: settings, ipaHistory: ipaHistory, webHistory: webHistory)
+    }
+
+    func acceptAgreement() {
+        settings.userAgreementAccepted = true
+        showAgreementSheet = false
+        persist()
+    }
+
+    func handleIncomingURL(_ url: URL) {
+        pendingBrowserLoadURL = url.absoluteString
+        settings.lastPasteboardURL = url.absoluteString
+        selectedTab = .browser
+        persist()
+    }
+
+    func loadFromPasteboardPrompt() {
+        guard let pasteboardPromptURL else { return }
+        pendingBrowserLoadURL = pasteboardPromptURL
+        settings.lastPasteboardURL = pasteboardPromptURL
+        self.pasteboardPromptURL = nil
+        selectedTab = .browser
+        persist()
+    }
+
+    func dismissPasteboardPrompt() {
+        if let pasteboardPromptURL {
+            settings.lastPasteboardURL = pasteboardPromptURL
+        }
+        self.pasteboardPromptURL = nil
+        persist()
+    }
+
+    func updateLastLoadedURL(_ value: String) {
+        settings.lastLoadedURL = value
+        persist()
+    }
+
+    func registerVisitedPage(title: String, url: String, host: String, faviconURL: String?) {
+        guard !url.isEmpty else { return }
+        let entry = WebHistoryEntry(
+            id: UUID(),
+            title: title.isEmpty ? host : title,
+            url: url,
+            host: host,
+            faviconURL: faviconURL,
+            lastVisitedAt: .now
+        )
+
+        webHistory.removeAll { $0.url == url }
+        webHistory.insert(entry, at: 0)
+        persist()
+    }
+
+    func upsertRecord(_ record: IpaRecord, present: Bool = true) {
+        if let existingIndex = ipaHistory.firstIndex(where: { $0.id == record.id }) {
+            var merged = record
+            merged.localFileName = ipaHistory[existingIndex].localFileName ?? record.localFileName
+            ipaHistory[existingIndex] = merged
+        } else {
+            ipaHistory.insert(record, at: 0)
+        }
+
+        if present {
+            presentedRecordID = record.id
+        }
+        selectedTab = .history
+        persist()
+    }
+
+    func renameRecord(id: String, title: String) {
+        guard let index = ipaHistory.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        ipaHistory[index].title = trimmed
+        persist()
+    }
+
+    func record(for id: String) -> IpaRecord? {
+        ipaHistory.first(where: { $0.id == id })
+    }
+
+    func deleteHistoryRecord(_ id: String) {
+        guard let record = record(for: id), let fileURL = localFileURL(for: record) else {
+            ipaHistory.removeAll { $0.id == id }
+            persist()
+            return
+        }
+
+        persistence.deleteFileIfNeeded(at: fileURL)
+        ipaHistory.removeAll { $0.id == id }
+        downloads.removeAll { $0.recordID == id }
+        persist()
+    }
+
+    func clearHistory() {
+        ipaHistory.compactMap(localFileURL(for:)).forEach(persistence.deleteFileIfNeeded(at:))
+        ipaHistory.removeAll()
+        downloads.removeAll()
+        persist()
+    }
+
+    func clearWebHistory() {
+        webHistory.removeAll()
+        persist()
+    }
+
+    func startDownload(for id: String) {
+        guard let record = record(for: id) else { return }
+        guard let sourceURL = URL(string: record.downloadURL) else {
+            notice = AppNotice(
+                title: L10n.string("notice.downloadFailed.title"),
+                message: L10n.string("notice.downloadFailed.invalidURL")
+            )
+            return
+        }
+
+        do {
+            try persistence.prepareDirectories()
+            let destinationURL = try downloadURL(for: record)
+            updateDownload(
+                DownloadItem(
+                    id: record.id,
+                    recordID: record.id,
+                    title: record.displayFileName,
+                    sourceURL: record.downloadURL,
+                    destinationURL: destinationURL,
+                    receivedBytes: 0,
+                    expectedBytes: 0,
+                    state: .queued,
+                    errorMessage: nil
+                )
+            )
+            downloadCoordinator.start(recordID: record.id, sourceURL: sourceURL, destinationURL: destinationURL)
+            selectedTab = .downloads
+        } catch {
+            notice = AppNotice(title: L10n.string("notice.downloadFailed.title"), message: error.localizedDescription)
+        }
+    }
+
+    func cancelDownload(_ id: String) {
+        downloadCoordinator.cancel(recordID: id)
+    }
+
+    func prepareExport() {
+        guard let text = persistence.exportPayload(snapshot: snapshot) else {
+            notice = AppNotice(
+                title: L10n.string("notice.exportFailed.title"),
+                message: L10n.string("notice.exportFailed.message")
+            )
+            return
+        }
+        sharePayload = SharePayload(text: text)
+    }
+
+    func importFromPasteboard() {
+        guard let content = UIPasteboard.general.string, !content.isEmpty else {
+            notice = AppNotice(
+                title: L10n.string("notice.importFailed.title"),
+                message: L10n.string("notice.importFailed.emptyPasteboard")
+            )
+            return
+        }
+
+        do {
+            let imported = try persistence.importPayload(content)
+            for record in imported.ipaHistory where !record.downloadURL.isEmpty {
+                upsertRecord(record, present: false)
+            }
+            for entry in imported.webHistory {
+                webHistory.removeAll { $0.url == entry.url }
+                webHistory.insert(entry, at: 0)
+            }
+            persist()
+            notice = AppNotice(
+                title: L10n.string("notice.importComplete.title"),
+                message: L10n.importCompleteMessage(
+                    ipaCount: imported.ipaHistory.count,
+                    webHistoryCount: imported.webHistory.count
+                )
+            )
+        } catch {
+            notice = AppNotice(title: L10n.string("notice.importFailed.title"), message: error.localizedDescription)
+        }
+    }
+
+    func localFileURL(for record: IpaRecord) -> URL? {
+        guard let localFileName = record.localFileName else { return nil }
+        return persistence.downloadsDirectory.appendingPathComponent(localFileName, isDirectory: false)
+    }
+
+    func fileSizeText(for record: IpaRecord) -> String {
+        guard let localFileURL = localFileURL(for: record) else { return L10n.string("common.notDownloaded") }
+        let size = persistence.fileSize(at: localFileURL)
+        return ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+    }
+
+    private func checkPasteboard() {
+        guard settings.userAgreementAccepted else { return }
+        guard let value = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return
+        }
+
+        let prefixes = ["http://", "https://", "itms-services://"]
+        guard prefixes.contains(where: value.hasPrefix) else { return }
+        guard !value.hasSuffix(".ipa") else { return }
+        guard settings.lastPasteboardURL != value else { return }
+        pasteboardPromptURL = value
+    }
+
+    private func cleanupMissingFiles() {
+        for index in ipaHistory.indices {
+            guard let fileURL = localFileURL(for: ipaHistory[index]) else { continue }
+            if !persistence.fileExists(at: fileURL) {
+                ipaHistory[index].localFileName = nil
+            }
+        }
+        persist()
+    }
+
+    private func handleDownloadEvent(_ event: DownloadCoordinator.Event) {
+        switch event {
+        case let .progress(recordID, receivedBytes, expectedBytes):
+            updateDownloadProgress(recordID: recordID, receivedBytes: receivedBytes, expectedBytes: expectedBytes)
+        case let .finished(recordID, fileName):
+            if let index = ipaHistory.firstIndex(where: { $0.id == recordID }) {
+                ipaHistory[index].localFileName = fileName
+            }
+            markDownloadFinished(recordID: recordID)
+            persist()
+        case let .failed(recordID, message):
+            markDownloadFailed(recordID: recordID, message: message)
+        case let .cancelled(recordID):
+            downloads.removeAll { $0.recordID == recordID }
+        }
+    }
+
+    private func updateDownload(_ item: DownloadItem) {
+        if let index = downloads.firstIndex(where: { $0.recordID == item.recordID }) {
+            downloads[index] = item
+        } else {
+            downloads.insert(item, at: 0)
+        }
+    }
+
+    private func updateDownloadProgress(recordID: String, receivedBytes: Int64, expectedBytes: Int64) {
+        guard let index = downloads.firstIndex(where: { $0.recordID == recordID }) else { return }
+        downloads[index].receivedBytes = receivedBytes
+        downloads[index].expectedBytes = expectedBytes
+        downloads[index].state = .downloading
+    }
+
+    private func markDownloadFinished(recordID: String) {
+        guard let index = downloads.firstIndex(where: { $0.recordID == recordID }) else { return }
+        downloads[index].receivedBytes = max(downloads[index].expectedBytes, downloads[index].receivedBytes)
+        downloads[index].state = .finished
+        downloads[index].errorMessage = nil
+    }
+
+    private func markDownloadFailed(recordID: String, message: String) {
+        guard let index = downloads.firstIndex(where: { $0.recordID == recordID }) else { return }
+        downloads[index].state = .failed
+        downloads[index].errorMessage = message
+    }
+
+    private func downloadURL(for record: IpaRecord) throws -> URL {
+        let fileName = "\(record.id)-\(record.displayFileName)"
+        let sanitized = fileName.replacingOccurrences(of: "/", with: "-")
+        let destinationURL = persistence.downloadsDirectory.appendingPathComponent(sanitized)
+        persistence.deleteFileIfNeeded(at: destinationURL)
+        return destinationURL
+    }
+}
+
+private final class DownloadCoordinator: NSObject, URLSessionDownloadDelegate {
+    enum Event {
+        case progress(recordID: String, receivedBytes: Int64, expectedBytes: Int64)
+        case finished(recordID: String, fileName: String)
+        case failed(recordID: String, message: String)
+        case cancelled(recordID: String)
+    }
+
+    var eventHandler: ((Event) -> Void)?
+
+    private lazy var session: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 60
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+    }()
+
+    private var taskMap: [Int: TaskContext] = [:]
+
+    struct TaskContext {
+        var recordID: String
+        var destinationURL: URL
+    }
+
+    func start(recordID: String, sourceURL: URL, destinationURL: URL) {
+        var request = URLRequest(url: sourceURL)
+        request.setValue("com.apple.appstored/1.0 iOS/18.0", forHTTPHeaderField: "User-Agent")
+        let task = session.downloadTask(with: request)
+        taskMap[task.taskIdentifier] = TaskContext(recordID: recordID, destinationURL: destinationURL)
+        task.resume()
+    }
+
+    func cancel(recordID: String) {
+        guard let pair = taskMap.first(where: { $0.value.recordID == recordID }) else { return }
+        session.getAllTasks { tasks in
+            tasks.first(where: { $0.taskIdentifier == pair.key })?.cancel()
+        }
+        taskMap.removeValue(forKey: pair.key)
+        eventHandler?(.cancelled(recordID: recordID))
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        guard let context = taskMap[downloadTask.taskIdentifier] else { return }
+        eventHandler?(.progress(recordID: context.recordID, receivedBytes: totalBytesWritten, expectedBytes: totalBytesExpectedToWrite))
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        guard let context = taskMap[downloadTask.taskIdentifier] else { return }
+
+        do {
+            let destinationURL = context.destinationURL
+            try? FileManager.default.removeItem(at: destinationURL)
+            try FileManager.default.moveItem(at: location, to: destinationURL)
+            eventHandler?(.finished(recordID: context.recordID, fileName: destinationURL.lastPathComponent))
+        } catch {
+            eventHandler?(.failed(recordID: context.recordID, message: error.localizedDescription))
+        }
+
+        taskMap.removeValue(forKey: downloadTask.taskIdentifier)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let context = taskMap[task.taskIdentifier] else { return }
+        defer { taskMap.removeValue(forKey: task.taskIdentifier) }
+
+        if let error {
+            let nsError = error as NSError
+            if nsError.code == NSURLErrorCancelled {
+                eventHandler?(.cancelled(recordID: context.recordID))
+            } else {
+                eventHandler?(.failed(recordID: context.recordID, message: error.localizedDescription))
+            }
+        }
+    }
+}
