@@ -4,8 +4,18 @@ import UIKit
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published var settings: AppSettings
-    @Published var ipaHistory: [IpaRecord]
+    @Published var settings: AppSettings {
+        didSet {
+            guard oldValue.historySort != settings.historySort else { return }
+            rebuildHistoryCaches()
+        }
+    }
+    @Published var ipaHistory: [IpaRecord] {
+        didSet {
+            fileSizeTextCache.removeAll()
+            rebuildHistoryCaches()
+        }
+    }
     @Published var webHistory: [WebHistoryEntry]
     @Published var downloads: [DownloadItem] = []
     @Published var selectedTab: RootTab = .browser
@@ -16,17 +26,19 @@ final class AppModel: ObservableObject {
     @Published var pendingBrowserLoadURL: String?
     @Published var showAgreementSheet = false
 
-    let extractor = ManifestExtractor()
-
     private let persistence = PersistenceController()
     private let downloadCoordinator = DownloadCoordinator()
     private var hasActivated = false
+    private var sortedHistoryCache: [IpaRecord] = []
+    private var downloadedHistoryCache: [IpaRecord] = []
+    private var fileSizeTextCache: [String: String] = [:]
 
     init() {
         let snapshot = persistence.loadSnapshot()
         settings = snapshot.settings
         ipaHistory = snapshot.ipaHistory
         webHistory = snapshot.webHistory
+        rebuildHistoryCaches()
 
         downloadCoordinator.eventHandler = { [weak self] event in
             Task { @MainActor in
@@ -36,24 +48,11 @@ final class AppModel: ObservableObject {
     }
 
     var sortedHistory: [IpaRecord] {
-        switch settings.historySort {
-        case .createdAtDescending:
-            ipaHistory.sorted { $0.createdAt > $1.createdAt }
-        case .fileNameAscending:
-            ipaHistory.sorted {
-                $0.displayTitle.localizedStandardCompare($1.displayTitle) == .orderedAscending
-            }
-        }
+        sortedHistoryCache
     }
 
     var downloadedHistory: [IpaRecord] {
-        ipaHistory.filter { record in
-            guard let url = localFileURL(for: record) else { return false }
-            return persistence.fileExists(at: url)
-        }
-        .sorted { lhs, rhs in
-            lhs.createdAt > rhs.createdAt
-        }
+        downloadedHistoryCache
     }
 
     func activate() {
@@ -65,8 +64,12 @@ final class AppModel: ObservableObject {
         cleanupMissingFiles()
     }
 
-    func persist() {
-        persistence.saveSnapshot(snapshot)
+    func persist(synchronously: Bool = false) {
+        if synchronously {
+            persistence.saveSnapshotSynchronously(snapshot)
+        } else {
+            persistence.saveSnapshot(snapshot)
+        }
     }
 
     var snapshot: AppSnapshot {
@@ -238,13 +241,27 @@ final class AppModel: ObservableObject {
 
         do {
             let imported = try persistence.importPayload(content)
+
+            var updatedHistory = ipaHistory
             for record in imported.ipaHistory where !record.downloadURL.isEmpty {
-                upsertRecord(record, present: false)
+                if let existingIndex = updatedHistory.firstIndex(where: { $0.id == record.id }) {
+                    var merged = record
+                    merged.localFileName = updatedHistory[existingIndex].localFileName ?? record.localFileName
+                    updatedHistory[existingIndex] = merged
+                } else {
+                    updatedHistory.insert(record, at: 0)
+                }
             }
+
+            ipaHistory = updatedHistory
+
+            var updatedWebHistory = webHistory
             for entry in imported.webHistory {
-                webHistory.removeAll { $0.url == entry.url }
-                webHistory.insert(entry, at: 0)
+                updatedWebHistory.removeAll { $0.url == entry.url }
+                updatedWebHistory.insert(entry, at: 0)
             }
+
+            webHistory = updatedWebHistory
             persist()
             notice = AppNotice(
                 title: L10n.string("notice.importComplete.title"),
@@ -264,9 +281,16 @@ final class AppModel: ObservableObject {
     }
 
     func fileSizeText(for record: IpaRecord) -> String {
+        if let cached = fileSizeTextCache[record.id] {
+            return cached
+        }
+
         guard let localFileURL = localFileURL(for: record) else { return L10n.string("common.notDownloaded") }
-        let size = persistence.fileSize(at: localFileURL)
-        return ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+        guard persistence.fileExists(at: localFileURL) else { return L10n.string("common.notDownloaded") }
+
+        let text = ByteCountFormatter.appFileSizeString(from: persistence.fileSize(at: localFileURL))
+        fileSizeTextCache[record.id] = text
+        return text
     }
 
     private func checkPasteboard() {
@@ -283,13 +307,19 @@ final class AppModel: ObservableObject {
     }
 
     private func cleanupMissingFiles() {
-        for index in ipaHistory.indices {
-            guard let fileURL = localFileURL(for: ipaHistory[index]) else { continue }
+        var updatedHistory = ipaHistory
+        var didChange = false
+        for index in updatedHistory.indices {
+            guard let fileURL = localFileURL(for: updatedHistory[index]) else { continue }
             if !persistence.fileExists(at: fileURL) {
-                ipaHistory[index].localFileName = nil
+                updatedHistory[index].localFileName = nil
+                didChange = true
             }
         }
-        persist()
+        if didChange {
+            ipaHistory = updatedHistory
+            persist()
+        }
     }
 
     private func handleDownloadEvent(_ event: DownloadCoordinator.Event) {
@@ -361,6 +391,21 @@ final class AppModel: ObservableObject {
         persistence.deleteFileIfNeeded(at: finalURL)
         return DownloadCoordinator.Destination(stagingURL: finalURL, finalURL: finalURL)
     }
+
+    private func rebuildHistoryCaches() {
+        switch settings.historySort {
+        case .createdAtDescending:
+            sortedHistoryCache = ipaHistory.sorted { $0.createdAt > $1.createdAt }
+        case .fileNameAscending:
+            sortedHistoryCache = ipaHistory.sorted {
+                $0.displayTitle.localizedStandardCompare($1.displayTitle) == .orderedAscending
+            }
+        }
+
+        downloadedHistoryCache = ipaHistory
+            .filter(\.hasLocalFile)
+            .sorted { $0.createdAt > $1.createdAt }
+    }
 }
 
 private final class DownloadCoordinator: NSObject, URLSessionDownloadDelegate {
@@ -391,6 +436,8 @@ private final class DownloadCoordinator: NSObject, URLSessionDownloadDelegate {
         var recordID: String
         var stagingURL: URL
         var finalURL: URL
+        var lastReportedBytes: Int64 = 0
+        var lastReportTime: Date = .distantPast
     }
 
     func start(recordID: String, sourceURL: URL, destination: Destination) {
@@ -423,7 +470,17 @@ private final class DownloadCoordinator: NSObject, URLSessionDownloadDelegate {
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        guard let context = taskMap[downloadTask.taskIdentifier] else { return }
+        guard var context = taskMap[downloadTask.taskIdentifier] else { return }
+        let now = Date()
+        let hasFinished = totalBytesExpectedToWrite > 0 && totalBytesWritten >= totalBytesExpectedToWrite
+        let crossedByteThreshold = totalBytesWritten - context.lastReportedBytes >= 256 * 1024
+        let crossedTimeThreshold = now.timeIntervalSince(context.lastReportTime) >= 0.2
+
+        guard hasFinished || crossedByteThreshold || crossedTimeThreshold else { return }
+
+        context.lastReportedBytes = totalBytesWritten
+        context.lastReportTime = now
+        taskMap[downloadTask.taskIdentifier] = context
         eventHandler?(.progress(recordID: context.recordID, receivedBytes: totalBytesWritten, expectedBytes: totalBytesExpectedToWrite))
     }
 

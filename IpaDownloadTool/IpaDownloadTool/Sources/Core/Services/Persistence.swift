@@ -2,12 +2,10 @@ import Foundation
 
 struct PersistenceController {
     private let fileManager = FileManager.default
-    private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let snapshotWriter = SnapshotWriter()
 
     init() {
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
     }
 
@@ -40,10 +38,12 @@ struct PersistenceController {
     }
 
     func saveSnapshot(_ snapshot: AppSnapshot) {
+        snapshotWriter.scheduleSave(snapshot, rootDirectory: rootDirectory, downloadsDirectory: downloadsDirectory, stateURL: stateURL)
+    }
+
+    func saveSnapshotSynchronously(_ snapshot: AppSnapshot) {
         do {
-            try prepareDirectories()
-            let data = try encoder.encode(snapshot)
-            try data.write(to: stateURL, options: .atomic)
+            try Self.writeSnapshot(snapshot, rootDirectory: rootDirectory, downloadsDirectory: downloadsDirectory, stateURL: stateURL)
         } catch {
             assertionFailure("Failed to save snapshot: \(error)")
         }
@@ -66,7 +66,7 @@ struct PersistenceController {
         let export = ExportBundle(ipaHistory: exportedHistory, webHistory: snapshot.webHistory)
 
         do {
-            let data = try encoder.encode(export)
+            let data = try Self.makeEncoder().encode(export)
             return String(decoding: data, as: UTF8.self)
         } catch {
             return nil
@@ -106,6 +106,77 @@ struct PersistenceController {
     func fileSize(at url: URL) -> Int64 {
         let attributes = try? fileManager.attributesOfItem(atPath: url.path)
         return attributes?[.size] as? Int64 ?? 0
+    }
+
+    fileprivate static func makeEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }
+
+    fileprivate static func writeSnapshot(
+        _ snapshot: AppSnapshot,
+        rootDirectory: URL,
+        downloadsDirectory: URL,
+        stateURL: URL
+    ) throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true, attributes: nil)
+        try fileManager.createDirectory(at: downloadsDirectory, withIntermediateDirectories: true, attributes: nil)
+        let data = try makeEncoder().encode(snapshot)
+        try data.write(to: stateURL, options: .atomic)
+    }
+}
+
+private final class SnapshotWriter: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "PersistenceController.SnapshotWriter", qos: .utility)
+    private var pendingSnapshot: AppSnapshot?
+    private var pendingRootDirectory: URL?
+    private var pendingDownloadsDirectory: URL?
+    private var pendingStateURL: URL?
+    private var isSaving = false
+
+    func scheduleSave(_ snapshot: AppSnapshot, rootDirectory: URL, downloadsDirectory: URL, stateURL: URL) {
+        queue.async {
+            self.pendingSnapshot = snapshot
+            self.pendingRootDirectory = rootDirectory
+            self.pendingDownloadsDirectory = downloadsDirectory
+            self.pendingStateURL = stateURL
+
+            guard !self.isSaving else { return }
+            self.isSaving = true
+            self.drainQueue()
+        }
+    }
+
+    private func drainQueue() {
+        queue.async {
+            guard
+                let snapshot = self.pendingSnapshot,
+                let rootDirectory = self.pendingRootDirectory,
+                let downloadsDirectory = self.pendingDownloadsDirectory,
+                let stateURL = self.pendingStateURL
+            else {
+                self.isSaving = false
+                return
+            }
+
+            self.pendingSnapshot = nil
+
+            do {
+                try PersistenceController.writeSnapshot(
+                    snapshot,
+                    rootDirectory: rootDirectory,
+                    downloadsDirectory: downloadsDirectory,
+                    stateURL: stateURL
+                )
+            } catch {
+                assertionFailure("Failed to save snapshot: \(error)")
+            }
+
+            self.drainQueue()
+        }
     }
 }
 

@@ -92,10 +92,10 @@ private struct DownloadRow: View {
                 .animation(.easeInOut, value: item.progress)
 
             HStack {
-                Text(ByteCountFormatter.string(fromByteCount: item.receivedBytes, countStyle: .file))
+                Text(ByteCountFormatter.appFileSizeString(from: item.receivedBytes))
                 Spacer()
                 if item.expectedBytes > 0 {
-                    Text(ByteCountFormatter.string(fromByteCount: item.expectedBytes, countStyle: .file))
+                    Text(ByteCountFormatter.appFileSizeString(from: item.expectedBytes))
                 } else {
                     Text("downloads.size.calculating")
                 }

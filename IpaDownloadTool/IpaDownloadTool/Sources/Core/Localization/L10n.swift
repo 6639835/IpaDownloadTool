@@ -25,3 +25,15 @@ extension Date {
         formatted(date: .abbreviated, time: .shortened)
     }
 }
+
+extension ByteCountFormatter {
+    private static let appFileSizeFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
+    static func appFileSizeString(from byteCount: Int64) -> String {
+        appFileSizeFormatter.string(fromByteCount: byteCount)
+    }
+}

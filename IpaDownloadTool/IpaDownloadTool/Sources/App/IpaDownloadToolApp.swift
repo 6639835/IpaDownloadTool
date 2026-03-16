@@ -19,7 +19,7 @@ struct IpaDownloadToolApp: App {
                         model.activate()
                     }
                     if newPhase == .background {
-                        model.persist()
+                        model.persist(synchronously: true)
                     }
                 }
         }
