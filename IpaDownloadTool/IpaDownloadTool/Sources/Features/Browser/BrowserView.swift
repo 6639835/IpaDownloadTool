@@ -20,21 +20,11 @@ struct BrowserView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .principal) {
-                        AddressBar(browser: browser)
-                    }
-
-                    ToolbarItemGroup(placement: .topBarTrailing) {
-                        PasteButton(payloadType: String.self) { strings in
-                            guard let first = strings.first else { return }
-                            browser.addressText = first
-                            browser.load(first)
-                        }
-                        .labelStyle(.iconOnly)
-
-                        Button {
+                        AddressBar(browser: browser) {
                             browser.scannerPresented = true
-                        } label: {
-                            Image(systemName: "qrcode.viewfinder")
+                        } onPaste: { string in
+                            browser.addressText = string
+                            browser.load(string)
                         }
                     }
 
@@ -148,6 +138,8 @@ struct BrowserView: View {
 
 private struct AddressBar: View {
     @ObservedObject var browser: BrowserController
+    let onScan: () -> Void
+    let onPaste: (String) -> Void
 
     var body: some View {
         HStack(spacing: 6) {
@@ -163,6 +155,23 @@ private struct AddressBar: View {
                 .onSubmit {
                     browser.load(browser.addressText)
                 }
+
+            Divider()
+                .frame(height: 16)
+
+            PasteButton(payloadType: String.self) { strings in
+                guard let first = strings.first else { return }
+                onPaste(first)
+            }
+            .labelStyle(.iconOnly)
+            .buttonBorderShape(.capsule)
+            .buttonStyle(.borderless)
+
+            Button(action: onScan) {
+                Image(systemName: "qrcode.viewfinder")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
